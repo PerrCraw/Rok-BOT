@@ -50,6 +50,235 @@ TESSERACT_PATH = r"tesseract-ocr\\tesseract.exe"
 if OPENCV_AVAILABLE:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
+class BuffDetector:
+    """Advanced buff detection system for ROK"""
+    
+    def __init__(self, parent_tool):
+        self.parent = parent_tool
+        self.buffs_path = BUFFS_PATH
+        self.buff_templates = {}
+        self.active_buffs = {}
+        self.buff_history = []
+        self.monitoring = False
+        self.monitor_thread = None
+        
+        # Detection settings
+        self.scan_interval = 5.0
+        self.detection_threshold = 0.75
+        self.buff_timeout = 300
+        
+        # Scan regions
+        self.scan_regions = {
+            "Nhan": {
+                "top_left": (50, 50, 400, 150),
+                "top_right": (1520, 50, 1870, 150),
+                "bottom": (700, 900, 1220, 1000)
+            },
+            "Huy": {
+                "top_left": (80, 80, 600, 240),
+                "top_right": (2280, 80, 2840, 240),
+                "bottom": (1050, 1440, 1830, 1600)
+            }
+        }
+        
+        self.load_buff_templates()
+    
+    def load_buff_templates(self):
+        """Load all buff images from buffs folder"""
+        if not OPENCV_AVAILABLE:
+            self.parent.log("[BuffDetector] OpenCV not available")
+            return
+        
+        if not os.path.exists(self.buffs_path):
+            os.makedirs(self.buffs_path, exist_ok=True)
+            self.parent.log(f"[BuffDetector] Created buffs folder: {self.buffs_path}")
+            return
+        
+        buff_files = [f for f in os.listdir(self.buffs_path) if f.endswith(('.png', '.jpg', '.jpeg'))]
+        
+        for filename in buff_files:
+            filepath = os.path.join(self.buffs_path, filename)
+            try:
+                template = cv2.imread(filepath)
+                if template is not None:
+                    buff_name = os.path.splitext(filename)[0]
+                    self.buff_templates[buff_name] = template
+                    self.parent.log(f"[BuffDetector] Loaded: {buff_name}")
+            except Exception as e:
+                self.parent.log(f"[BuffDetector] Error loading {filename}: {e}")
+        
+        self.parent.log(f"[BuffDetector] Loaded {len(self.buff_templates)} buff templates")
+    
+    def find_buff_on_screen(self, buff_name, template, screenshot_path=SCREENSHOT_PATH):
+        """Search for buff template on screen"""
+        try:
+            if not os.path.exists(screenshot_path):
+                return False, None, 0.0
+            
+            screen = cv2.imread(screenshot_path)
+            if screen is None:
+                return False, None, 0.0
+            
+            regions = self.scan_regions.get(self.parent.active_profile, self.scan_regions["Nhan"])
+            
+            best_confidence = 0.0
+            best_position = None
+            
+            for region_name, (x1, y1, x2, y2) in regions.items():
+                region = screen[y1:y2, x1:x2]
+                if region.size == 0:
+                    continue
+                
+                result = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                
+                if max_val > best_confidence:
+                    best_confidence = max_val
+                    center_x = x1 + max_loc[0] + template.shape[1] // 2
+                    center_y = y1 + max_loc[1] + template.shape[0] // 2
+                    best_position = (center_x, center_y)
+            
+            if best_confidence >= self.detection_threshold:
+                return True, best_position, best_confidence
+            
+            return False, None, best_confidence
+            
+        except Exception as e:
+            self.parent.log(f"[BuffDetector] Error detecting {buff_name}: {e}")
+            return False, None, 0.0
+    
+    def scan_for_buffs(self):
+        """Scan screen for all buff templates"""
+        if not OPENCV_AVAILABLE or not self.buff_templates:
+            return []
+        
+        detected = []
+        current_time = time.time()
+        
+        # Take screenshot
+        try:
+            if hasattr(self.parent, 'connected_devices') and len(self.parent.connected_devices) > 0:
+                device_id = list(self.parent.connected_devices)[0]
+                self.parent.adb_screencap(device_id)
+            elif AUTOGUI_AVAILABLE:
+                from PIL import ImageGrab
+                screenshot = ImageGrab.grab()
+                screenshot.save(SCREENSHOT_PATH)
+            else:
+                return []
+        except Exception as e:
+            self.parent.log(f"[BuffDetector] Screenshot error: {e}")
+            return []
+        
+        # Check each buff
+        for buff_name, template in self.buff_templates.items():
+            found, position, confidence = self.find_buff_on_screen(buff_name, template)
+            
+            if found:
+                buff_info = {
+                    'name': buff_name,
+                    'position': position,
+                    'confidence': round(confidence * 100, 1),
+                    'detected_at': current_time,
+                    'timestamp': datetime.now().strftime("%H:%M:%S")
+                }
+                detected.append(buff_info)
+                
+                if buff_name not in self.active_buffs:
+                    self.active_buffs[buff_name] = buff_info
+                    self.buff_history.append(buff_info)
+                    self.parent.log(f"[BuffDetector] ✓ {buff_name} detected ({buff_info['confidence']}%)")
+                    
+                    if self.parent.webhook_enabled:
+                        self.send_buff_webhook(buff_name, "detected", buff_info)
+                else:
+                    self.active_buffs[buff_name].update(buff_info)
+        
+        # Remove expired buffs
+        expired = []
+        for buff_name, buff_info in self.active_buffs.items():
+            if current_time - buff_info['detected_at'] > self.buff_timeout:
+                expired.append(buff_name)
+        
+        for buff_name in expired:
+            del self.active_buffs[buff_name]
+            self.parent.log(f"[BuffDetector] ✗ {buff_name} expired")
+            
+            if self.parent.webhook_enabled:
+                self.send_buff_webhook(buff_name, "expired", None)
+        
+        return detected
+    
+    def monitor_loop(self):
+        """Background monitoring loop"""
+        self.parent.log("[BuffDetector] Monitoring started")
+        
+        while self.monitoring:
+            try:
+                detected = self.scan_for_buffs()
+                
+                if self.parent.root and hasattr(self.parent, 'update_buff_display'):
+                    self.parent.root.after(0, self.parent.update_buff_display)
+                
+                time.sleep(self.scan_interval)
+                
+            except Exception as e:
+                self.parent.log(f"[BuffDetector] Monitor error: {e}")
+                time.sleep(5)
+        
+        self.parent.log("[BuffDetector] Monitoring stopped")
+    
+    def start_monitoring(self):
+        """Start buff monitoring"""
+        if not OPENCV_AVAILABLE:
+            self.parent.log("[BuffDetector] OpenCV required for monitoring")
+            return False
+        
+        if not self.buff_templates:
+            self.parent.log("[BuffDetector] No buff templates loaded")
+            return False
+        
+        if self.monitoring:
+            return False
+        
+        self.monitoring = True
+        self.monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
+        self.monitor_thread.start()
+        return True
+    
+    def stop_monitoring(self):
+        """Stop buff monitoring"""
+        self.monitoring = False
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=2)
+    
+    def get_active_buffs(self):
+        """Get list of currently active buffs"""
+        return list(self.active_buffs.keys())
+    
+    def is_buff_active(self, buff_name):
+        """Check if specific buff is active"""
+        return buff_name in self.active_buffs
+    
+    def clear_history(self):
+        """Clear buff history"""
+        self.buff_history.clear()
+        self.parent.log("[BuffDetector] History cleared")
+    
+    def send_buff_webhook(self, buff_name, event_type, buff_info):
+        """Send webhook notification"""
+        try:
+            if event_type == "detected":
+                color = 0x27AE60
+                message = f"🛡️ **Buff Activated**\n**Name:** {buff_name}\n**Confidence:** {buff_info['confidence']}%\n**Time:** {buff_info['timestamp']}"
+            else:
+                color = 0xE74C3C
+                message = f"⏰ **Buff Expired**\n**Name:** {buff_name}"
+            
+            self.parent.send_webhook("info", message, color)
+        except Exception as e:
+            self.parent.log(f"[BuffDetector] Webhook error: {e}")
+
 class ROKUnifiedTool:
     def __init__(self):
         # Common settings
@@ -173,6 +402,9 @@ class ROKUnifiedTool:
         
         # Ensure directories
         self.ensure_directories()
+        
+        # Buff Detection System
+        self.buff_detector = BuffDetector(self)
         
     def hide_window(self):
         if self.root and not self.window_hidden:
@@ -2171,6 +2403,11 @@ Profile: {self.active_profile} ({len(self.march_slots)} slots)"""
         
         self.create_autofarm_tab(autofarm_tab)
         self.create_emulator_tab(emulator_tab)
+
+        # Tab 3: Buff Monitor
+        buff_tab = tk.Frame(notebook, bg="#2C3E50")
+        notebook.add(buff_tab, text="Buff Monitor")
+        self.create_buff_tab(buff_tab)
         
         # Hotkeys
         if AUTOGUI_AVAILABLE:
@@ -2668,13 +2905,162 @@ Profile: {self.active_profile} ({len(self.march_slots)} slots)"""
             self.stop_clearfog_btn.config(state=tk.DISABLED)
         if hasattr(self, 'start_clearfog_btn'):
             self.start_clearfog_btn.config(state=tk.NORMAL)
+
+    def create_buff_tab(self, parent):
+        """Create buff monitoring tab"""
+        container = tk.Frame(parent, bg="#2C3E50")
+        container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Control Panel
+        control_frame = tk.LabelFrame(container, text="Buff Monitor Control", bg="#2C3E50", 
+                                     fg="white", font=("Arial", 10))
+        control_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Settings
+        settings_frame = tk.Frame(control_frame, bg="#2C3E50")
+        settings_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(settings_frame, text="Scan Interval (sec):", bg="#2C3E50", fg="white", 
+                font=("Arial", 9)).pack(side=tk.LEFT, padx=5)
+        self.scan_interval_var = tk.StringVar(value="5")
+        tk.Entry(settings_frame, textvariable=self.scan_interval_var, width=5, bg="#34495E", 
+                fg="white", font=("Arial", 9), insertbackground="white").pack(side=tk.LEFT, padx=5)
+        
+        tk.Label(settings_frame, text="Threshold:", bg="#2C3E50", fg="white", 
+                font=("Arial", 9)).pack(side=tk.LEFT, padx=5)
+        self.threshold_var = tk.StringVar(value="0.75")
+        tk.Entry(settings_frame, textvariable=self.threshold_var, width=5, bg="#34495E", 
+                fg="white", font=("Arial", 9), insertbackground="white").pack(side=tk.LEFT, padx=5)
+        
+        # Buttons
+        btn_frame = tk.Frame(control_frame, bg="#2C3E50")
+        btn_frame.pack(pady=5)
+        
+        self.start_monitor_btn = tk.Button(btn_frame, text="Start Monitoring", 
+                                           command=self.start_buff_monitoring, bg="#27AE60", 
+                                           fg="white", font=("Arial", 9), width=15, cursor="hand2")
+        self.start_monitor_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_monitor_btn = tk.Button(btn_frame, text="Stop Monitoring", 
+                                          command=self.stop_buff_monitoring, bg="#E74C3C", 
+                                          fg="white", font=("Arial", 9), width=15, 
+                                          cursor="hand2", state=tk.DISABLED)
+        self.stop_monitor_btn.pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(btn_frame, text="Scan Now", command=self.manual_buff_scan, bg="#3498DB", 
+                 fg="white", font=("Arial", 9), width=15, cursor="hand2").pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(btn_frame, text="Clear History", command=self.clear_buff_history, 
+                 bg="#95A5A6", fg="white", font=("Arial", 9), width=15, 
+                 cursor="hand2").pack(side=tk.LEFT, padx=5)
+        
+        # Active Buffs Display
+        active_frame = tk.LabelFrame(container, text="Active Buffs", bg="#2C3E50", fg="white", 
+                                    font=("Arial", 10))
+        active_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        list_frame = tk.Frame(active_frame, bg="#2C3E50")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.buff_listbox = tk.Listbox(list_frame, bg="#34495E", fg="white", 
+                                       font=("Consolas", 9), yscrollcommand=scrollbar.set)
+        self.buff_listbox.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.buff_listbox.yview)
+        
+        # Statistics
+        stats_frame = tk.LabelFrame(container, text="Statistics", bg="#2C3E50", fg="white", 
+                                   font=("Arial", 10))
+        stats_frame.pack(fill=tk.X)
+        
+        self.buff_stat_loaded = tk.Label(stats_frame, text="Templates Loaded: 0", bg="#2C3E50", 
+                                         fg="white", font=("Arial", 9))
+        self.buff_stat_loaded.pack(anchor=tk.W, padx=10, pady=2)
+        
+        self.buff_stat_active = tk.Label(stats_frame, text="Active Buffs: 0", bg="#2C3E50", 
+                                        fg="white", font=("Arial", 9))
+        self.buff_stat_active.pack(anchor=tk.W, padx=10, pady=2)
+        
+        self.buff_stat_total = tk.Label(stats_frame, text="Total Detected: 0", bg="#2C3E50", 
+                                       fg="white", font=("Arial", 9))
+        self.buff_stat_total.pack(anchor=tk.W, padx=10, pady=2)
+        
+        self.update_buff_display()
     
+    def start_buff_monitoring(self):
+        """Start buff monitoring"""
+        try:
+            self.buff_detector.scan_interval = float(self.scan_interval_var.get())
+            self.buff_detector.detection_threshold = float(self.threshold_var.get())
+        except ValueError:
+            messagebox.showwarning("Invalid Input", "Please enter valid numbers")
+            return
+        
+        if self.buff_detector.start_monitoring():
+            self.start_monitor_btn.config(state=tk.DISABLED)
+            self.stop_monitor_btn.config(state=tk.NORMAL)
+            self.log("[BuffDetector] Monitoring started")
+            
+            if self.webhook_enabled:
+                self.send_webhook("info", "🛡️ Buff Monitoring Started", 0x3498DB)
+    
+    def stop_buff_monitoring(self):
+        """Stop buff monitoring"""
+        self.buff_detector.stop_monitoring()
+        self.start_monitor_btn.config(state=tk.NORMAL)
+        self.stop_monitor_btn.config(state=tk.DISABLED)
+        self.log("[BuffDetector] Monitoring stopped")
+        
+        if self.webhook_enabled:
+            self.send_webhook("warning", "⏸️ Buff Monitoring Stopped", 0xF39C12)
+    
+    def manual_buff_scan(self):
+        """Perform manual buff scan"""
+        self.log("[BuffDetector] Manual scan started...")
+        detected = self.buff_detector.scan_for_buffs()
+        
+        if detected:
+            self.log(f"[BuffDetector] Found {len(detected)} buffs")
+            for buff in detected:
+                self.log(f"  - {buff['name']} ({buff['confidence']}%)")
+        else:
+            self.log("[BuffDetector] No buffs detected")
+        
+        self.update_buff_display()
+    
+    def clear_buff_history(self):
+        """Clear buff history"""
+        self.buff_detector.clear_history()
+        self.update_buff_display()
+        self.log("[BuffDetector] History cleared")
+    
+    def update_buff_display(self):
+        """Update buff display in GUI"""
+        if not hasattr(self, 'buff_listbox'):
+            return
+        
+        self.buff_listbox.delete(0, tk.END)
+        
+        for buff_name, buff_info in self.buff_detector.active_buffs.items():
+            elapsed = int(time.time() - buff_info['detected_at'])
+            minutes = elapsed // 60
+            seconds = elapsed % 60
+            
+            display_text = f"🛡️ {buff_name} | {buff_info['confidence']}% | {minutes:02d}:{seconds:02d}"
+            self.buff_listbox.insert(tk.END, display_text)
+        
+        self.buff_stat_loaded.config(text=f"Templates Loaded: {len(self.buff_detector.buff_templates)}")
+        self.buff_stat_active.config(text=f"Active Buffs: {len(self.buff_detector.active_buffs)}")
+        self.buff_stat_total.config(text=f"Total Detected: {len(self.buff_detector.buff_history)}")
+
     def force_exit(self):
         self.running = False
         self.toggle = False
         self.stop_gather_flag = True
         self.stop_clear_fog_flag = True
-        
+        self.buff_detector.stop_monitoring()
         try:
             if AUTOGUI_AVAILABLE:
                 keyboard.unhook_all()
