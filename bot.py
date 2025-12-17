@@ -41,7 +41,9 @@ except ImportError:
 # Configuration
 ADB_PATH = "adb\\adb.exe"
 DATA_PATH = "data"
-RESOURCE_PATH = "resource"
+SAMPLES_PATH = "samples"
+ITEMS_PATH = "items"
+BUFFS_PATH = "buffs"
 SCREENSHOT_PATH = "cache\\screenshot.png"
 TESSERACT_PATH = r"tesseract-ocr\\tesseract.exe"
 
