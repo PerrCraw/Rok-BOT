@@ -42,8 +42,10 @@ except ImportError:
 ADB_PATH = "adb\\adb.exe"
 DATA_PATH = "data"
 SAMPLES_PATH = "samples"
+SECOND_SAMPLES_PATH = "samples2"
 ITEMS_PATH = "items"
 BUFFS_PATH = "buffs"
+GEMS_PATH = "gems"
 SCREENSHOT_PATH = "cache\\screenshot.png"
 TESSERACT_PATH = r"tesseract-ocr\\tesseract.exe"
 
@@ -70,14 +72,14 @@ class BuffDetector:
         # Scan regions
         self.scan_regions = {
             "Nhan": {
-                "top_left": (50, 50, 400, 150),
+                "top_left": (0, 0, 475, 200),
                 "top_right": (1520, 50, 1870, 150),
                 "bottom": (700, 900, 1220, 1000)
             },
             "Huy": {
-                "top_left": (80, 80, 600, 240),
-                "top_right": (2280, 80, 2840, 240),
-                "bottom": (1050, 1440, 1830, 1600)
+                "top_left": (0, 0, 3000, 1000),
+                "top_right": (8200, 0, 11400, 1000),
+                "bottom": (3400, 5200, 7800, 6400)
             }
         }
         
@@ -279,6 +281,299 @@ class BuffDetector:
         except Exception as e:
             self.parent.log(f"[BuffDetector] Webhook error: {e}")
 
+class AutoBuffActivator:
+    """Automatically activates buffs with 5-step process"""
+    
+    def __init__(self, parent_tool):
+        self.parent = parent_tool
+        self.samples_path = SAMPLES_PATH
+        self.items_path = ITEMS_PATH
+        
+        # Settings
+        self.auto_activation_enabled = False
+        self.activation_thread = None
+        self.check_interval = 60
+        self.last_activation_time = 0
+        self.activation_cooldown = 300
+        self.required_buffs = ["enhanced_gathering"]
+        
+        # CRITICAL: Mutex lock to prevent conflicts with AutoFarm
+        self.activation_lock = threading.Lock()
+        self.is_activating = False
+        
+        # Image paths (5 steps)
+        self.menu_img = os.path.join(self.samples_path, "menu_opened.png")
+        self.boosts_img = os.path.join(self.samples_path, "Boosts.png")
+        self.buff_img = os.path.join(self.items_path, "enhanced_gathering_blue.png")
+        self.use_img = os.path.join(self.samples_path, "use_ap.png")
+        self.close_img = os.path.join(self.samples_path, "CloseButton.png")
+        
+        # Statistics
+        self.total_activations = 0
+        self.failed_activations = 0
+        self.last_status = "None"
+        self.last_error_step = ""
+        
+        self.parent.log("[AutoBuffActivator] Initialized")
+    
+    def check_required_buffs_active(self):
+        """Check if required buffs are active"""
+        if not hasattr(self.parent, 'buff_detector'):
+            return False
+        
+        active = self.parent.buff_detector.get_active_buffs()
+        for req in self.required_buffs:
+            if not any(req.lower() in b.lower() for b in active):
+                self.parent.log(f"[AutoBuffActivator] Missing: {req}")
+                return False
+        return True
+    
+    def find_and_click(self, img_path, desc, threshold=0.75, wait=1.5):
+        """Find image and click with human-like movement - profile-aware"""
+        if not OPENCV_AVAILABLE or not AUTOGUI_AVAILABLE:
+            return False
+        
+        try:
+            from PIL import ImageGrab
+            import pyautogui
+            
+            # Get current profile
+            is_huy = self.parent.active_profile == "Huy"
+            
+            # Adjust threshold for Huy profile (larger screen = potentially different scaling)
+            if is_huy:
+                # Try with slightly lower threshold first for Huy
+                adjusted_threshold = threshold - 0.05
+                self.parent.log(f"[AutoBuffActivator] Huy profile - using threshold {adjusted_threshold}")
+            else:
+                adjusted_threshold = threshold
+            
+            # Take full screenshot (important for larger screens)
+            screenshot = ImageGrab.grab()
+            screenshot.save(SCREENSHOT_PATH)
+            
+            # Find with adjusted threshold
+            pos = self.parent.find_image(img_path, SCREENSHOT_PATH, adjusted_threshold)
+            
+            # If not found and it's Huy, try even lower threshold
+            if not pos and is_huy:
+                self.parent.log(f"[AutoBuffActivator] Trying lower threshold 0.65 for Huy")
+                pos = self.parent.find_image(img_path, SCREENSHOT_PATH, 0.65)
+            
+            if pos:
+                x, y = pos
+                
+                # For Huy profile, add some logging for debugging
+                if is_huy:
+                    self.parent.log(f"[AutoBuffActivator] Found {desc} at ({x},{y}) [Huy: 2560x1600]")
+                else:
+                    self.parent.log(f"[AutoBuffActivator] Found {desc} at ({x},{y})")
+                
+                # Human-like movement and click
+                self.parent.advanced_mouse_move(x, y)
+                time.sleep(random.uniform(0.1, 0.2))
+                pyautogui.click()
+                
+                self.parent.log(f"[AutoBuffActivator] Clicked {desc}")
+                time.sleep(random.uniform(wait*0.8, wait*1.2))
+                return True
+            else:
+                if is_huy:
+                    self.parent.log(f"[AutoBuffActivator] {desc} not found (Huy profile, checked thresholds 0.70 and 0.65)")
+                else:
+                    self.parent.log(f"[AutoBuffActivator] {desc} not found")
+                return False
+        except Exception as e:
+            self.parent.log(f"[AutoBuffActivator] Error: {e}")
+            return False
+    
+    def activate_buff(self):
+        """5-step activation sequence with mutex lock"""
+        
+        # CRITICAL: Acquire lock to prevent conflicts with AutoFarm
+        if not self.activation_lock.acquire(blocking=False):
+            self.parent.log("[AutoBuffActivator] Already activating or AutoFarm busy, skipping...")
+            return False
+        
+        try:
+            self.is_activating = True  # Set flag
+            self.parent.log("[AutoBuffActivator] === STARTING ACTIVATION ===")
+            self.parent.log(f"[AutoBuffActivator] Profile: {self.parent.active_profile}")
+            
+            # Step 1: Menu
+            self.parent.log("[AutoBuffActivator] Step 1/5: Menu...")
+            if not self.find_and_click(self.menu_img, "Menu", 0.75, 1.5):
+                self.last_error_step = "Step 1: Menu failed"
+                self.parent.log(f"[AutoBuffActivator] ✗ {self.last_error_step}")
+                return False
+            
+            # Step 2: Boosts
+            self.parent.log("[AutoBuffActivator] Step 2/5: Boosts...")
+            if not self.find_and_click(self.boosts_img, "Boosts", 0.75, 1.5):
+                self.last_error_step = "Step 2: Boosts failed"
+                self.parent.log(f"[AutoBuffActivator] ✗ {self.last_error_step}")
+                self.emergency_close()
+                return False
+            
+            # Step 3: Buff
+            self.parent.log("[AutoBuffActivator] Step 3/5: Buff...")
+            if not self.find_and_click(self.buff_img, "Gathering Buff", 0.75, 1.5):
+                self.last_error_step = "Step 3: Buff failed"
+                self.parent.log(f"[AutoBuffActivator] ✗ {self.last_error_step}")
+                self.emergency_close()
+                return False
+            
+            # Step 4: Use
+            self.parent.log("[AutoBuffActivator] Step 4/5: Use...")
+            if not self.find_and_click(self.use_img, "Use Button", 0.75, 2.0):
+                self.last_error_step = "Step 4: Use failed"
+                self.parent.log(f"[AutoBuffActivator] ✗ {self.last_error_step}")
+                self.emergency_close()
+                return False
+            
+            # Step 5: Close
+            self.parent.log("[AutoBuffActivator] Step 5/5: Close...")
+            if not self.find_and_click(self.close_img, "Close", 0.75, 1.0):
+                self.parent.log("[AutoBuffActivator] ⚠ Close failed, using ESC")
+                self.emergency_close()
+            
+            # Success
+            self.parent.log("[AutoBuffActivator] === ✓ ACTIVATION SUCCESS ===")
+            self.total_activations += 1
+            self.last_activation_time = time.time()
+            self.last_status = "Success"
+            self.last_error_step = ""
+            
+            if self.parent.webhook_enabled:
+                self.send_webhook("success")
+            
+            return True
+            
+        except Exception as e:
+            self.last_error_step = f"Exception: {e}"
+            self.parent.log(f"[AutoBuffActivator] ✗ Error: {e}")
+            self.failed_activations += 1
+            self.last_status = f"Failed: {e}"
+            
+            if self.parent.webhook_enabled:
+                self.send_webhook("failed", str(e))
+            
+            self.emergency_close()
+            return False
+        
+        finally:
+            # CRITICAL: Always release lock
+            self.is_activating = False
+            self.activation_lock.release()
+            self.parent.log("[AutoBuffActivator] Lock released")
+    
+    def emergency_close(self):
+        """Close menus with ESC"""
+        try:
+            if AUTOGUI_AVAILABLE:
+                import pyautogui
+                self.find_and_click(self.close_img, "Close", 0.7, 0.5)
+                for _ in range(3):
+                    pyautogui.press('esc')
+                    time.sleep(0.3)
+                self.parent.log("[AutoBuffActivator] Emergency close")
+        except:
+            pass
+    
+    def activation_loop(self):
+        """Background monitoring thread"""
+        self.parent.log("[AutoBuffActivator] Monitoring started")
+        self.parent.log(f"[AutoBuffActivator] Profile: {self.parent.active_profile}")
+        
+        while self.auto_activation_enabled:
+            try:
+                current = time.time()
+                since_last = current - self.last_activation_time
+                
+                # Cooldown check
+                if since_last < self.activation_cooldown:
+                    remain = int(self.activation_cooldown - since_last)
+                    if remain % 30 == 0:
+                        self.parent.log(f"[AutoBuffActivator] Cooldown: {remain}s")
+                    time.sleep(self.check_interval)
+                    continue
+                
+                # Buff check
+                if not self.check_required_buffs_active():
+                    self.parent.log("[AutoBuffActivator] Buffs missing, activating...")
+                    self.activate_buff()
+                else:
+                    self.parent.log("[AutoBuffActivator] ✓ Buffs active")
+                
+                # Update GUI
+                if self.parent.root and hasattr(self.parent, 'update_buff_activator_stats'):
+                    self.parent.root.after(0, self.parent.update_buff_activator_stats)
+                
+                time.sleep(self.check_interval)
+                
+            except Exception as e:
+                self.parent.log(f"[AutoBuffActivator] Loop error: {e}")
+                time.sleep(30)
+        
+        self.parent.log("[AutoBuffActivator] Monitoring stopped")
+    
+    def start_auto_activation(self):
+        """Start auto-activation"""
+        if not OPENCV_AVAILABLE or not AUTOGUI_AVAILABLE:
+            self.parent.log("[AutoBuffActivator] Requires OpenCV/PyAutoGUI")
+            return False
+        
+        # Check images exist
+        images = {
+            "menu_opened.png": self.menu_img,
+            "Boosts.png": self.boosts_img,
+            "enhanced_gathering_blue.png": self.buff_img,
+            "use_ap.png": self.use_img,
+            "CloseButton.png": self.close_img
+        }
+        
+        missing = [n for n, p in images.items() if not os.path.exists(p)]
+        if missing:
+            self.parent.log(f"[AutoBuffActivator] Missing: {', '.join(missing)}")
+            return False
+        
+        if self.auto_activation_enabled:
+            return False
+        
+        self.auto_activation_enabled = True
+        self.activation_thread = threading.Thread(target=self.activation_loop, daemon=True)
+        self.activation_thread.start()
+        
+        self.parent.log("[AutoBuffActivator] Started")
+        self.parent.log(f"[AutoBuffActivator] Active profile: {self.parent.active_profile}")
+        return True
+    
+    def stop_auto_activation(self):
+        """Stop auto-activation"""
+        self.auto_activation_enabled = False
+        if self.activation_thread:
+            self.activation_thread.join(timeout=2)
+        self.parent.log("[AutoBuffActivator] Stopped")
+    
+    def manual_activation(self):
+        """Manual trigger"""
+        self.parent.log("[AutoBuffActivator] Manual activation")
+        return self.activate_buff()
+    
+    def send_webhook(self, status, error=None):
+        """Send webhook notification"""
+        try:
+            if status == "success":
+                msg = f"✨ **Buff Activated**\n**Profile:** {self.parent.active_profile}\n**Time:** {datetime.now().strftime('%H:%M:%S')}\n**Total:** {self.total_activations}"
+                color = 0x27AE60
+            else:
+                msg = f"❌ **Activation Failed**\n**Profile:** {self.parent.active_profile}\n**Error:** {error}\n**Step:** {self.last_error_step}"
+                color = 0xE74C3C
+            
+            self.parent.send_webhook("info", msg, color)
+        except:
+            pass
+
 class ROKUnifiedTool:
     def __init__(self):
         # Common settings
@@ -405,6 +700,9 @@ class ROKUnifiedTool:
         
         # Buff Detection System
         self.buff_detector = BuffDetector(self)
+
+        # Buff Auto-Activation
+        self.auto_buff_activator = AutoBuffActivator(self)
         
     def hide_window(self):
         if self.root and not self.window_hidden:
@@ -1684,105 +1982,6 @@ class ROKUnifiedTool:
         print(f"\nStatus: {'GATHERING (Busy)' if is_busy else 'EMPTY (Ready)'}")
         print("=" * 60)
 
-    # ==================== UPDATED send_march METHOD ====================
-    # Replace your existing send_march method with this improved version
-
-    def send_march(self, slot_index):
-        if not AUTOGUI_AVAILABLE:
-            return False
-
-        try:
-            self.update_fatigue()
-            
-            # Check for micro-break
-            if self.check_micro_break():
-                return False
-            
-            if not self.can_send_march(slot_index):
-                self.log(f"Slot {slot_index + 1} in cooldown")
-                return False
-            
-            # IMPROVED: Use enhanced verification
-            if not self.verify_slot_empty(slot_index):
-                self.log(f"Slot {slot_index + 1} already active, skipping")
-                return False
-            
-            self.slot_last_check[slot_index] = time.time() * 1000
-            res_x, res_y, confirm_x, confirm_y, res_name = self.get_random_resource()
-            
-            self.total_marches += 1
-            self.log(f"March {slot_index + 1} - {res_name} (Fatigue: {round(self.fatigue_level)}%)")
-            
-            # Step 1: Click search button
-            search_x, search_y = self.search_button
-            self.advanced_mouse_move(search_x, search_y)
-            time.sleep(random.uniform(0.08, 0.18))
-            pyautogui.click()
-            time.sleep(random.uniform(0.9, 1.6))
-            
-            # Step 2: Click resource type
-            self.advanced_mouse_move(res_x, res_y)
-            time.sleep(random.uniform(0.08, 0.18))
-            pyautogui.click()
-            time.sleep(random.uniform(0.7, 1.3))
-            
-            # Step 3: Click confirm resource
-            self.advanced_mouse_move(confirm_x, confirm_y)
-            time.sleep(random.uniform(0.08, 0.18))
-            pyautogui.click()
-            time.sleep(random.uniform(1.3, 2.2))
-            
-            # Random micro pause
-            if random.randint(1, 100) <= 25:
-                time.sleep(random.uniform(0.3, 0.8))
-            
-            # Step 4: Click gather button
-            gather_x, gather_y = self.gather_btn
-            self.advanced_mouse_move(gather_x, gather_y)
-            time.sleep(random.uniform(0.08, 0.18))
-            pyautogui.click()
-            time.sleep(random.uniform(1.1, 1.9))
-            
-            # Step 5: Click send troops button
-            troops_x, troops_y = self.send_troops_btn
-            self.advanced_mouse_move(troops_x, troops_y)
-            time.sleep(random.uniform(0.08, 0.18))
-            pyautogui.click()
-            time.sleep(random.uniform(1.6, 2.3))
-            
-            # Random micro pause
-            if random.randint(1, 100) <= 20:
-                time.sleep(random.uniform(0.5, 1.0))
-            
-            # Step 6: Click march confirm
-            confirm_march_x, confirm_march_y = self.march_confirm
-            self.advanced_mouse_move(confirm_march_x, confirm_march_y)
-            time.sleep(random.uniform(0.08, 0.18))
-            pyautogui.click()
-            time.sleep(random.uniform(2.2, 2.8))
-            
-            # IMPROVED: Use enhanced verification
-            if self.verify_march_started(slot_index):
-                self.log(f"✅ March {slot_index + 1} SUCCESS - {res_name}")
-                self.successful_marches += 1
-                self.update_stats()
-                if self.webhook_enabled and self.webhook_on_success:
-                    self.send_webhook("success", f"✅ March {slot_index + 1} SUCCESS - {res_name}", 0x27AE60)
-                return True
-            else:
-                self.log(f"❌ March {slot_index + 1} FAILED - {res_name}")
-                self.update_stats()
-                if self.webhook_enabled and self.webhook_on_fail:
-                    self.send_webhook("error", f"❌ March {slot_index + 1} FAILED - {res_name}", 0xE74C3C)
-                return False
-            
-        except Exception as e:
-            self.log(f"Send march error: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-
     # ==================== DEBUGGING HELPER ====================
     def debug_slot_colors(self, slot_index):
         """
@@ -1882,9 +2081,14 @@ class ROKUnifiedTool:
     
     def send_march(self, slot_index):
         """
-        Enhanced send_march with improved verification
+        Enhanced send_march with conflict prevention
         """
         if not AUTOGUI_AVAILABLE:
+            return False
+    
+        # CRITICAL: Check if AutoBuffActivator is running
+        if hasattr(self, 'auto_buff_activator') and self.auto_buff_activator.is_activating:
+            self.log(f"Slot {slot_index + 1} waiting for buff activation to complete...")
             return False
     
         try:
@@ -1898,7 +2102,7 @@ class ROKUnifiedTool:
                 self.log(f"Slot {slot_index + 1} in cooldown")
                 return False
         
-            # IMPROVED: Use enhanced verification to check if slot is busy
+            # Verify slot is empty
             if not self.verify_slot_empty(slot_index):
                 self.log(f"Slot {slot_index + 1} already active, skipping")
                 return False
@@ -1908,10 +2112,8 @@ class ROKUnifiedTool:
             
             self.total_marches += 1
             self.log(f"March {slot_index + 1} - {res_name} (Fatigue: {round(self.fatigue_level)}%)")
-            print(f"Starting march for slot {slot_index + 1}")
             
             # Step 1: Click search button
-            print(f"Step 1: Clicking search button at {self.search_button}")
             search_x, search_y = self.search_button
             self.advanced_mouse_move(search_x, search_y)
             time.sleep(random.uniform(0.08, 0.18))
@@ -1919,14 +2121,12 @@ class ROKUnifiedTool:
             time.sleep(random.uniform(0.9, 1.6))
             
             # Step 2: Click resource type
-            print(f"Step 2: Clicking resource {res_name} at ({res_x}, {res_y})")
             self.advanced_mouse_move(res_x, res_y)
             time.sleep(random.uniform(0.08, 0.18))
             pyautogui.click()
             time.sleep(random.uniform(0.7, 1.3))
             
             # Step 3: Click confirm resource
-            print(f"Step 3: Clicking confirm at ({confirm_x}, {confirm_y})")
             self.advanced_mouse_move(confirm_x, confirm_y)
             time.sleep(random.uniform(0.08, 0.18))
             pyautogui.click()
@@ -1937,7 +2137,6 @@ class ROKUnifiedTool:
                 time.sleep(random.uniform(0.3, 0.8))
             
             # Step 4: Click gather button
-            print(f"Step 4: Clicking gather button at {self.gather_btn}")
             gather_x, gather_y = self.gather_btn
             self.advanced_mouse_move(gather_x, gather_y)
             time.sleep(random.uniform(0.08, 0.18))
@@ -1945,7 +2144,6 @@ class ROKUnifiedTool:
             time.sleep(random.uniform(1.1, 1.9))
             
             # Step 5: Click send troops button
-            print(f"Step 5: Clicking send troops at {self.send_troops_btn}")
             troops_x, troops_y = self.send_troops_btn
             self.advanced_mouse_move(troops_x, troops_y)
             time.sleep(random.uniform(0.08, 0.18))
@@ -1957,17 +2155,14 @@ class ROKUnifiedTool:
                 time.sleep(random.uniform(0.5, 1.0))
             
             # Step 6: Click march confirm
-            print(f"Step 6: Clicking march confirm at {self.march_confirm}")
             confirm_march_x, confirm_march_y = self.march_confirm
             self.advanced_mouse_move(confirm_march_x, confirm_march_y)
             time.sleep(random.uniform(0.08, 0.18))
             pyautogui.click()
             time.sleep(random.uniform(2.2, 2.8))
             
-            # IMPROVED: Use enhanced verification to confirm march started
-            print(f"Step 7: Verifying march started for slot {slot_index + 1}")
+            # Verify march started
             if self.verify_march_started(slot_index):
-                print(f"✅ March {slot_index + 1} SUCCESS - {res_name}")
                 self.log(f"✅ March {slot_index + 1} SUCCESS - {res_name}")
                 self.successful_marches += 1
                 self.update_stats()
@@ -1975,7 +2170,6 @@ class ROKUnifiedTool:
                     self.send_webhook("success", f"✅ March {slot_index + 1} SUCCESS - {res_name}", 0x27AE60)
                 return True
             else:
-                print(f"❌ March {slot_index + 1} FAILED - {res_name}")
                 self.log(f"❌ March {slot_index + 1} FAILED - {res_name}")
                 self.update_stats()
                 if self.webhook_enabled and self.webhook_on_fail:
@@ -1984,15 +2178,21 @@ class ROKUnifiedTool:
             
         except Exception as e:
             self.log(f"Send march error: {e}")
-            print(f"Send march error: {e}")
             import traceback
             traceback.print_exc()
             return False
                     
     def autofarm_loop(self):
+        """Main AutoFarm loop with buff activation awareness"""
         while self.running:
             if not self.toggle:
                 time.sleep(0.1)
+                continue
+            
+            # CRITICAL: Check if buff activator is busy
+            if hasattr(self, 'auto_buff_activator') and self.auto_buff_activator.is_activating:
+                self.log("[AutoFarm] Waiting for buff activation...")
+                time.sleep(2)
                 continue
             
             self.update_fatigue()
@@ -2006,6 +2206,11 @@ class ROKUnifiedTool:
             
             march_sent = False
             for i in range(len(self.march_slots)):
+                # Check again before each march attempt
+                if hasattr(self, 'auto_buff_activator') and self.auto_buff_activator.is_activating:
+                    self.log(f"[AutoFarm] Slot {i+1} skipped - buff activation in progress")
+                    break
+                
                 time.sleep(random.uniform(0.7, 2.0))
                 check_x, check_y = self.march_slots[i]
                 if not self.is_gathering(check_x, check_y):
@@ -2021,7 +2226,7 @@ class ROKUnifiedTool:
                     time.sleep(random.uniform(3, 7))
             
             time.sleep(random.uniform(2, 5))
-    
+
     # ==================== Webhook Functions ====================
     
     def send_webhook(self, event_type, message, color=None):
@@ -2969,7 +3174,10 @@ Profile: {self.active_profile} ({len(self.march_slots)} slots)"""
                                        font=("Consolas", 9), yscrollcommand=scrollbar.set)
         self.buff_listbox.pack(fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.buff_listbox.yview)
-        
+
+        # Add auto-activation controls
+        self.update_buff_tab_with_activator(container)
+
         # Statistics
         stats_frame = tk.LabelFrame(container, text="Statistics", bg="#2C3E50", fg="white", 
                                    font=("Arial", 10))
@@ -3055,12 +3263,353 @@ Profile: {self.active_profile} ({len(self.march_slots)} slots)"""
         self.buff_stat_active.config(text=f"Active Buffs: {len(self.buff_detector.active_buffs)}")
         self.buff_stat_total.config(text=f"Total Detected: {len(self.buff_detector.buff_history)}")
 
+    def update_buff_tab_with_activator(self, container):
+        """Add activation controls to buff tab"""
+        import tkinter as tk
+        
+        # Frame
+        frame = tk.LabelFrame(container, text="🔄 Auto Buff Activation (Optional)", 
+                            bg="#2C3E50", fg="white", font=("Arial", 10, "bold"))
+        frame.pack(fill=tk.X, pady=(10, 0))
+        
+        # Enable/Disable Checkbox
+        enable_frame = tk.Frame(frame, bg="#2C3E50")
+        enable_frame.pack(fill=tk.X, padx=10, pady=8)
+        
+        self.auto_buff_enabled_var = tk.BooleanVar(value=False)
+        enable_check = tk.Checkbutton(enable_frame, 
+                                    text="Enable Auto Buff Activation (starts with F8)", 
+                                    variable=self.auto_buff_enabled_var,
+                                    command=self.toggle_auto_buff_controls,
+                                    bg="#2C3E50", fg="white", 
+                                    selectcolor="#34495E",
+                                    font=("Arial", 10, "bold"),
+                                    activebackground="#2C3E50",
+                                    activeforeground="white")
+        enable_check.pack(side=tk.LEFT)
+        
+        # Info label
+        info_label = tk.Label(frame, 
+                            text="When enabled, auto-activation starts/stops together with AutoFarm (F8)",
+                            bg="#2C3E50", fg="#BDC3C7", font=("Arial", 8, "italic"))
+        info_label.pack(pady=(0, 5))
+        
+        # Settings Container (initially disabled)
+        self.buff_settings_container = tk.Frame(frame, bg="#2C3E50")
+        self.buff_settings_container.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Process info
+        process_frame = tk.Frame(self.buff_settings_container, bg="#34495E", relief=tk.GROOVE, borderwidth=1)
+        process_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(process_frame, text="5-Step Process:", bg="#34495E", fg="white", 
+                font=("Arial", 8, "bold")).pack(anchor=tk.W, padx=5, pady=2)
+        tk.Label(process_frame, text="Menu → Boosts → Buff → Use → Close",
+                bg="#34495E", fg="#BDC3C7", font=("Arial", 8)).pack(anchor=tk.W, padx=5, pady=2)
+        
+        # Settings grid
+        settings = tk.Frame(self.buff_settings_container, bg="#2C3E50")
+        settings.pack(fill=tk.X, pady=5)
+        
+        tk.Label(settings, text="Check Interval (sec):", bg="#2C3E50", fg="white", 
+                font=("Arial", 9)).grid(row=0, column=0, sticky=tk.W, padx=5, pady=3)
+        self.buff_check_var = tk.StringVar(value="60")
+        self.buff_check_entry = tk.Entry(settings, textvariable=self.buff_check_var, width=8, 
+                                        bg="#34495E", fg="white", insertbackground="white",
+                                        font=("Arial", 9))
+        self.buff_check_entry.grid(row=0, column=1, padx=5, pady=3)
+        
+        tk.Label(settings, text="Cooldown (sec):", bg="#2C3E50", fg="white", 
+                font=("Arial", 9)).grid(row=0, column=2, sticky=tk.W, padx=5, pady=3)
+        self.buff_cooldown_var = tk.StringVar(value="300")
+        self.buff_cooldown_entry = tk.Entry(settings, textvariable=self.buff_cooldown_var, width=8, 
+                                        bg="#34495E", fg="white", insertbackground="white",
+                                        font=("Arial", 9))
+        self.buff_cooldown_entry.grid(row=0, column=3, padx=5, pady=3)
+        
+        tk.Label(settings, text="Monitor Buff Name:", bg="#2C3E50", fg="white", 
+                font=("Arial", 9)).grid(row=1, column=0, sticky=tk.W, padx=5, pady=3)
+        self.buff_name_var = tk.StringVar(value="enhanced_gathering")
+        self.buff_name_entry = tk.Entry(settings, textvariable=self.buff_name_var, width=30, 
+                                        bg="#34495E", fg="white", insertbackground="white",
+                                        font=("Arial", 9))
+        self.buff_name_entry.grid(row=1, column=1, columnspan=3, sticky=tk.W, padx=5, pady=3)
+        
+        # Status indicator
+        status_frame = tk.Frame(self.buff_settings_container, bg="#34495E", relief=tk.GROOVE, borderwidth=2)
+        status_frame.pack(fill=tk.X, pady=5)
+        
+        self.buff_activation_status = tk.Label(status_frame, 
+                                            text="⏸ Status: Idle (Press F8 to start)", 
+                                            bg="#34495E", fg="#F39C12", 
+                                            font=("Arial", 9, "bold"))
+        self.buff_activation_status.pack(pady=5)
+        
+        # Manual test button
+        test_frame = tk.Frame(self.buff_settings_container, bg="#2C3E50")
+        test_frame.pack(pady=5)
+        
+        self.test_buff_btn = tk.Button(test_frame, text="🎯 Test Activation (Manual)", 
+                                    command=self.test_buff_activation, 
+                                    bg="#3498DB", fg="white", 
+                                    font=("Arial", 9, "bold"), 
+                                    width=25, cursor="hand2")
+        self.test_buff_btn.pack()
+        
+        # Stats
+        stats = tk.Frame(self.buff_settings_container, bg="#34495E", relief=tk.GROOVE, borderwidth=2)
+        stats.pack(fill=tk.X, pady=8)
+        
+        tk.Label(stats, text="📊 Activation Statistics", bg="#34495E", fg="white", 
+                font=("Arial", 9, "bold")).pack(pady=3)
+        
+        grid = tk.Frame(stats, bg="#34495E")
+        grid.pack(padx=10, pady=5)
+        
+        self.buff_stat_total = tk.Label(grid, text="Total: 0", 
+                                        bg="#34495E", fg="#27AE60", 
+                                        font=("Arial", 9, "bold"))
+        self.buff_stat_total.grid(row=0, column=0, padx=10)
+        
+        self.buff_stat_failed = tk.Label(grid, text="Failed: 0", 
+                                        bg="#34495E", fg="#E74C3C", 
+                                        font=("Arial", 9, "bold"))
+        self.buff_stat_failed.grid(row=0, column=1, padx=10)
+        
+        self.buff_stat_last = tk.Label(stats, text="Last: None", 
+                                    bg="#34495E", fg="#BDC3C7", 
+                                    font=("Arial", 8))
+        self.buff_stat_last.pack(pady=(0, 5))
+        
+        # Required images info
+        req_frame = tk.Frame(self.buff_settings_container, bg="#34495E", relief=tk.GROOVE, borderwidth=1)
+        req_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(req_frame, text="📁 Required Images:", bg="#34495E", fg="white", 
+                font=("Arial", 8, "bold")).pack(anchor=tk.W, padx=5, pady=2)
+        
+        required_images = [
+            "samples/menu_opened.png",
+            "samples/Boosts.png", 
+            "items/enhanced_gathering_blue.png",
+            "samples/use_ap.png",
+            "samples/CloseButton.png"
+        ]
+        
+        for img in required_images:
+            exists = os.path.exists(img)
+            icon = "✓" if exists else "✗"
+            color = "#27AE60" if exists else "#E74C3C"
+            tk.Label(req_frame, text=f"{icon} {img}", bg="#34495E", fg=color, 
+                    font=("Arial", 7)).pack(anchor=tk.W, padx=15, pady=1)
+        
+        # Initially disable all controls
+        self.toggle_auto_buff_controls()
+
+    def toggle_auto_buff_controls(self):
+        """Enable/disable auto buff controls based on checkbox"""
+        enabled = self.auto_buff_enabled_var.get()
+        
+        if enabled:
+            state = tk.NORMAL
+            self.log("[AutoBuffActivator] Feature enabled - will start with F8")
+        else:
+            state = tk.DISABLED
+            self.log("[AutoBuffActivator] Feature disabled")
+            
+            # Stop if running
+            if hasattr(self, 'auto_buff_activator') and self.auto_buff_activator.auto_activation_enabled:
+                self.auto_buff_activator.stop_auto_activation()
+                self.update_buff_activation_status("disabled")
+        
+        # Update entry fields
+        if hasattr(self, 'buff_check_entry'):
+            self.buff_check_entry.config(state=state)
+        if hasattr(self, 'buff_cooldown_entry'):
+            self.buff_cooldown_entry.config(state=state)
+        if hasattr(self, 'buff_name_entry'):
+            self.buff_name_entry.config(state=state)
+        if hasattr(self, 'test_buff_btn'):
+            self.test_buff_btn.config(state=state)
+
+    def update_buff_activation_status(self, status):
+        """Update the status indicator"""
+        if not hasattr(self, 'buff_activation_status'):
+            return
+        
+        if status == "running":
+            self.buff_activation_status.config(
+                text="▶ Status: Running (started with F8)",
+                fg="#27AE60"
+            )
+        elif status == "stopped":
+            self.buff_activation_status.config(
+                text="⏸ Status: Stopped (press F8 to start)",
+                fg="#F39C12"
+            )
+        elif status == "disabled":
+            self.buff_activation_status.config(
+                text="⏸ Status: Idle (feature disabled)",
+                fg="#95A5A6"
+            )
+
+    def start_auto_buff_with_autofarm(self):
+        """Start auto-activation when AutoFarm starts (F8)"""
+        if not self.auto_buff_enabled_var.get():
+            # Feature is disabled, don't start
+            return
+        
+        try:
+            # Update settings from GUI
+            self.auto_buff_activator.check_interval = int(self.buff_check_var.get())
+            self.auto_buff_activator.activation_cooldown = int(self.buff_cooldown_var.get())
+            buff_names = self.buff_name_var.get().strip()
+            if buff_names:
+                self.auto_buff_activator.required_buffs = [b.strip() for b in buff_names.split(',')]
+        except ValueError:
+            self.log("[AutoBuffActivator] Invalid settings, using defaults")
+        
+        # Start auto-activation
+        if self.auto_buff_activator.start_auto_activation():
+            self.update_buff_activation_status("running")
+            self.log("[AutoBuffActivator] Started with AutoFarm")
+            
+            if self.webhook_enabled:
+                self.send_webhook("info", "🔄 Auto Buff Activation Started (with AutoFarm)", 0x3498DB)
+
+    def stop_auto_buff_with_autofarm(self):
+        """Stop auto-activation when AutoFarm stops (F8)"""
+        if hasattr(self, 'auto_buff_activator') and self.auto_buff_activator.auto_activation_enabled:
+            self.auto_buff_activator.stop_auto_activation()
+            self.update_buff_activation_status("stopped")
+            self.log("[AutoBuffActivator] Stopped with AutoFarm")
+            
+            if self.webhook_enabled:
+                self.send_webhook("warning", "⏸️ Auto Buff Activation Stopped (with AutoFarm)", 0xF39C12)
+
+    def test_buff_activation(self):
+        """Manual test"""
+        if not self.auto_buff_enabled_var.get():
+            from tkinter import messagebox
+            messagebox.showwarning("Feature Disabled", 
+                                "Please enable Auto Buff Activation first by checking the checkbox.")
+            return
+        
+        from tkinter import messagebox
+        
+        self.log("[AutoBuffActivator] Manual test started by user...")
+        
+        # Show info dialog
+        result = messagebox.askokcancel("Test Activation", 
+                                        "This will test the 5-step buff activation process.\n\n"
+                                        "Make sure:\n"
+                                        "• Game is running and visible\n"
+                                        "• You're at the main city screen\n"
+                                        "• All 5 images are in correct folders\n\n"
+                                        "Continue?")
+        
+        if not result:
+            return
+        
+        success = self.auto_buff_activator.manual_activation()
+        self.update_buff_activator_stats()
+        
+        if success:
+            messagebox.showinfo("Test Successful", 
+                            "✓ Buff activation test completed successfully!\n\n"
+                            "Check the game to verify the buff was activated.\n\n"
+                            "Now you can press F8 to start AutoFarm,\n"
+                            "and buff activation will start automatically!")
+        else:
+            error = self.auto_buff_activator.last_error_step if self.auto_buff_activator.last_error_step else "Unknown error"
+            messagebox.showwarning("Test Failed", 
+                                f"✗ Buff activation test failed\n\n"
+                                f"Error: {error}\n\n"
+                                f"Check the log file for detailed information.\n"
+                                f"Verify all required images exist and are correct.")
+
+    def update_buff_activator_stats(self):
+        """Update stats display"""
+        if not hasattr(self, 'buff_stat_total'):
+            return
+        
+        self.buff_stat_total.config(text=f"Total: {self.auto_buff_activator.total_activations}")
+        self.buff_stat_failed.config(text=f"Failed: {self.auto_buff_activator.failed_activations}")
+        
+        status = self.auto_buff_activator.last_status
+        if len(status) > 40:
+            status = status[:37] + "..."
+        self.buff_stat_last.config(text=f"Last: {status}")
+
+    # ============================================================
+    # SECTION 4: Update toggle_autofarm method
+    # REPLACE the existing toggle_autofarm method with this version
+    # ============================================================
+
+    def toggle_autofarm(self):
+        """Toggle AutoFarm and Auto Buff Activation together"""
+        if not AUTOGUI_AVAILABLE:
+            messagebox.showerror("Error", "PyAutoGUI not available!\nInstall: pip install pyautogui pillow keyboard")
+            return
+        
+        self.toggle = not self.toggle
+        if self.toggle:
+            if len(self.selected_resources) == 0:
+                messagebox.showwarning("No Resources", "Please select at least one resource!")
+                self.toggle = False
+                return
+            
+            self.session_start_time = time.time() * 1000
+            self.session_actions_count = 0
+            self.fatigue_level = 0
+            self.last_break_time = time.time() * 1000
+            self.last_webhook_time = time.time() * 1000
+            
+            mode = "Rotation" if self.resource_rotation_enabled else "Fixed"
+            resources = ", ".join(self.selected_resources)
+            
+            self.log(f"=== AUTOFARM START - {self.active_profile} Profile - {mode} Mode ===")
+            self.log(f"Resources: {resources}")
+            
+            # START AUTO BUFF ACTIVATION IF ENABLED
+            if hasattr(self, 'auto_buff_enabled_var') and self.auto_buff_enabled_var.get():
+                self.start_auto_buff_with_autofarm()
+            
+            if self.webhook_enabled and self.webhook_on_start:
+                msg = f"🚀 AutoFarm Started\n**Profile:** {self.active_profile}\n**Mode:** {mode}\n**Resources:** {resources}"
+                if hasattr(self, 'auto_buff_enabled_var') and self.auto_buff_enabled_var.get():
+                    msg += "\n**Auto Buff:** Enabled"
+                self.send_webhook("info", msg, 0x3498DB)
+            
+            if self.auto_hide_enabled:
+                self.root.after(500, self.hide_window)
+            
+            if not self.running:
+                self.running = True
+                threading.Thread(target=self.autofarm_loop, daemon=True).start()
+        else:
+            self.log("AutoFarm stopped")
+            
+            # STOP AUTO BUFF ACTIVATION IF RUNNING
+            if hasattr(self, 'auto_buff_enabled_var') and self.auto_buff_enabled_var.get():
+                self.stop_auto_buff_with_autofarm()
+            
+            if self.auto_hide_enabled and self.window_hidden:
+                self.show_window()
+            
+            if self.webhook_enabled and self.webhook_on_stop:
+                self.send_webhook("warning", "⏸️ AutoFarm Stopped", 0xF39C12)
+
     def force_exit(self):
         self.running = False
         self.toggle = False
         self.stop_gather_flag = True
         self.stop_clear_fog_flag = True
         self.buff_detector.stop_monitoring()
+        if hasattr(self, 'auto_buff_activator'):
+            self.auto_buff_activator.stop_auto_activation()
+        if hasattr(self, 'buff_detector'):
+            self.buff_detector.stop_monitoring()
         try:
             if AUTOGUI_AVAILABLE:
                 keyboard.unhook_all()
